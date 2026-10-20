@@ -2114,9 +2114,18 @@ impl Automation {
         let on: Vec<(i32, i32, bool)> = doc.info.layers.iter().map(|l| (l.id.0 as i32, i32::from(l.id.1), true)).collect();
         let bytes = doc.bytes.clone();
         let password: Option<Arc<str>> = doc.password.as_deref().map(Arc::from);
-        extract_with_layers(&bytes, password, pages, Arc::new(on))
-            .into_iter()
-            .map(|(p, text)| text.map_err(|e| failed(format!("page {}: {e}", p + 1))))
+        // Keyed by page, then answered in the order the caller asked for: the parallel path
+        // returns pages sorted, and the caller pairs this list with its own page list by
+        // position. Redaction asks for the pages that hold matches, in match order, so a list
+        // that isn't ascending would otherwise mark one page with another page's matches.
+        let texts: HashMap<usize, _> = extract_with_layers(&bytes, password, pages, Arc::new(on)).into_iter().collect();
+        pages
+            .iter()
+            .map(|p| match texts.get(p) {
+                Some(Ok(text)) => Ok(text.clone()),
+                Some(Err(e)) => Err(failed(format!("page {}: {e}", p + 1))),
+                None => Err(failed(format!("page {}: text extraction returned no result", p + 1))),
+            })
             .collect()
     }
 
@@ -2946,6 +2955,24 @@ mod tests {
         json(&mut a, "doc_close", json!({ "doc": first.0, "discard_changes": true }));
         json(&mut a, "doc_close", json!({ "doc": second.0 }));
         assert_eq!((a.texts.bytes(), a.texts.len()), (0, 0));
+    }
+
+    /// The all-layer search answers in the order it was asked. The parallel path returns pages
+    /// sorted by number, and `redact_mark` pairs the texts with its own page list by position --
+    /// and redaction asks for the pages that hold matches, in match order, not in ascending
+    /// order. A page would then be marked with another page's matches and the word would stay in
+    /// the saved file, which is the leak #3646 is about. Nine pages, so the parallel path is the
+    /// one taken (it begins at eight, on a machine with more than one core).
+    #[test]
+    fn the_all_layer_search_answers_in_the_order_it_was_asked() {
+        let mut a = Automation::new();
+        let id = search_document(&mut a, 9);
+        let pages: Vec<usize> = (0..9).rev().collect();
+        let texts: Vec<String> = a.page_texts_every_layer(id, &pages).unwrap().iter().map(|t| t.plain_text()).collect();
+        assert_eq!(texts, pages.iter().map(|p| format!("Page {}", p + 1)).collect::<Vec<_>>());
+        // A page asked for twice is answered twice, as `page_texts` answers it.
+        let twice: Vec<String> = a.page_texts_every_layer(id, &[3, 3]).unwrap().iter().map(|t| t.plain_text()).collect();
+        assert_eq!(twice, ["Page 4", "Page 4"]);
     }
 
     #[test]
