@@ -1170,10 +1170,22 @@ fn show(scope: &Scope<'_>, gs: &Gs, tm: &mut Matrix, items: &[Object]) -> (Vec<O
                     let origin = trm.apply(0.0, 0.0);
                     let advance = w0 * size + spacing;
                     let hit = match scope.hidden_text {
-                        // Invisible (Tr 3) and clip-only (Tr 7) text, or text wholly off the page.
+                        // Invisible (Tr 3) text, or text wholly off the page.
+                        //
+                        // Not clip-only (Tr 7). Those glyphs paint nothing themselves, but they
+                        // are the clipping path for whatever is painted until the enclosing `Q`:
+                        // a title drawn in 7 Tr and then filled is visible text, seen through the
+                        // letters. Removing the glyphs leaves a text object that shows none, so
+                        // no clip is set and the fill floods its whole rectangle -- the title
+                        // became a solid box (#3644). The same flood as #3123 and #3429, reached
+                        // through Remove Hidden Information.
+                        //
+                        // A 7 Tr object with nothing painted after it is invisible and is now
+                        // left alone too. Keeping it costs nothing on the page, which is the
+                        // trade the report asks for ("pages 2 and 3 may lose their title").
                         Some(page) => {
                             let degenerate = b[2] - b[0] < 0.01 && b[3] - b[1] < 0.01;
-                            matches!(gs.render_mode, 3 | 7) || !(overlaps(page, b, 0.0) || degenerate)
+                            gs.render_mode == 3 || !(overlaps(page, b, 0.0) || degenerate)
                         }
                         None => scope.glyph_hit(b, origin),
                     };

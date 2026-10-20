@@ -1305,6 +1305,33 @@ fn hidden_fixture() -> Document {
     doc
 }
 
+/// Text in clip-only mode (`7 Tr`) is not hidden text. Those glyphs paint nothing themselves, but
+/// they are the clipping path for whatever is painted until the enclosing `Q`, so a title drawn
+/// that way and then filled is visible -- seen through the letters. Removing the glyphs left a
+/// text object showing none, so no clip was set and the fill flooded its whole rectangle: the
+/// title became a solid box (#3644, the same flood as #3123 through a third entry point).
+#[test]
+fn clip_only_text_is_not_hidden_text() {
+    use crate::sanitize::{Hidden, remove_hidden, scan};
+    // A 7 Tr title with a fill painted through it, a 7 Tr title with nothing after it, and a
+    // 3 Tr title, which is the genuinely hidden one.
+    let stream = b"q BT 7 Tr /F1 10 Tf 10 200 Td (MASK) Tj ET 1 0 0 rg 5 195 90 20 re f Q q BT 7 Tr /F1 10 Tf 10 150 Td (BARE) Tj ET Q q BT 3 Tr /F1 10 Tf 10 100 Td (GONE) Tj ET Q BT /F1 10 Tf 10 50 Td (AFTER) Tj ET";
+    let mut doc = one_page(stream, "", Vec::new());
+
+    // Only the invisible title is counted: four glyphs, not twelve.
+    let counts: std::collections::HashMap<Hidden, usize> = scan(&doc).into_iter().collect();
+    assert_eq!(counts[&Hidden::HiddenText], 4, "only the 3 Tr title is hidden text");
+
+    let done = remove_hidden(&mut doc, &[Hidden::HiddenText]).unwrap();
+    assert_eq!(done, [(Hidden::HiddenText, 4)]);
+    let c = content(&doc, 0);
+    // The clipping titles and the visible line stay; the invisible one goes.
+    assert!(c.contains("(MASK)"), "the clipping title is kept, so its fill is still masked: {c}");
+    assert!(c.contains("(BARE)"), "a clipping title with nothing painted after it is kept too: {c}");
+    assert!(!c.contains("(GONE)"), "the 3 Tr title is removed: {c}");
+    assert!(c.contains("(AFTER)"), "{c}");
+}
+
 #[test]
 fn hidden_information_is_counted_and_removed() {
     use crate::sanitize::{Hidden, remove_hidden, sanitize, scan};
