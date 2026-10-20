@@ -393,6 +393,47 @@ fn a_form_that_fans_out_or_loops_is_bounded_by_the_page_budget() {
     }
 }
 
+/// A tiling pattern's cell is a content stream of its own and can draw text. Redacting a shape
+/// filled with such a pattern removed the fill from the page but left the pattern in the page's
+/// resources, so its cell -- with the text that was under the mark -- stayed in the saved file
+/// (#3647). A pattern nothing paints with any more now leaves the resources; one some surviving
+/// paint still uses stays.
+#[test]
+fn a_pattern_whose_only_painting_was_redacted_leaves_the_page() {
+    fn page_with(fills: &str) -> Document {
+        let cell = stream(
+            "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 300 300] /XStep 300 /YStep 300              /Resources << /Font << /F1 5 0 R >> >>",
+            b"BT /F1 10 Tf 10 150 Td (SECRET) Tj ET",
+        );
+        let content = format!("BT /F1 10 Tf 10 280 Td (PUBLIC) Tj ET {fills}");
+        one_page(content.as_bytes(), "/Pattern << /P0 7 0 R >>", vec![cell])
+    }
+    let has_pattern = |doc: &Document| {
+        pdfcraft_model::pages(doc)[0]
+            .dict
+            .get(b"Resources")
+            .and_then(|r| doc.resolve(r).as_dict().cloned())
+            .is_some_and(|res| res.get(b"Pattern").is_some())
+    };
+
+    // One box, marked: the pattern is no longer painted, so it goes with the fill.
+    let mut doc = page_with("/Pattern cs /P0 scn 20 140 100 30 re f");
+    mark(&mut doc, 0, &[[15.0, 135.0, 130.0, 175.0]], "");
+    let report = apply(&mut doc, None).unwrap();
+    assert_eq!(report.patterns_removed, 1, "the pattern left the page");
+    assert!(!has_pattern(&doc), "the page has no /Pattern left");
+    let saved = write_incremental(&doc, &SaveOptions::default()).unwrap();
+    assert!(!saved.windows(8).any(|w| w == b"(SECRET)"), "the cell's text is gone from the saved file");
+
+    // Two boxes with the same pattern, one marked: the other still paints it, so it stays -- and
+    // so does its text, which is still on the page for a reader to see.
+    let mut doc = page_with("/Pattern cs /P0 scn 20 140 100 30 re f /Pattern cs /P0 scn 20 40 100 30 re f");
+    mark(&mut doc, 0, &[[15.0, 135.0, 130.0, 175.0]], "");
+    let report = apply(&mut doc, None).unwrap();
+    assert_eq!(report.patterns_removed, 0, "a pattern still painted elsewhere is kept");
+    assert!(has_pattern(&doc), "the page keeps /Pattern for the box that still uses it");
+}
+
 #[test]
 fn shared_form_xobjects_are_copied_not_changed() {
     let form =
