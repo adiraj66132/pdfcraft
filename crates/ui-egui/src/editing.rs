@@ -684,7 +684,9 @@ impl PdfCraftApp {
             || v.fill_text.as_ref().is_some_and(|t| !t.text.trim().is_empty())
             || new_text_typed(v)
             || v.line_editor.as_ref().map_or_else(|| false, |ed| ed.has_unsaved_text())
-            || matches!(comment_draft(v, &doc.info), Some(CommentDraft::Changes(_)))
+            // A typed note whose comment is gone counts too: closing asks, so Cancel and Redo can
+            // still bring its comment back. An empty one (`Discard`) has nothing to lose.
+            || matches!(comment_draft(v, &doc.info), Some(CommentDraft::Changes(_) | CommentDraft::Orphaned))
     }
 
     /// Save the active document. Returns `true` if it was written.
