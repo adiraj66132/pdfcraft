@@ -1330,6 +1330,20 @@ fn clip_only_text_is_not_hidden_text() {
     assert!(c.contains("(BARE)"), "a clipping title with nothing painted after it is kept too: {c}");
     assert!(!c.contains("(GONE)"), "the 3 Tr title is removed: {c}");
     assert!(c.contains("(AFTER)"), "{c}");
+
+    // Nor does being off the page make a clipping glyph hidden text. The clip is set by the text
+    // object as a whole, so taking the glyphs outside the page widens it -- and taking all of
+    // them sets no clip at all, which floods whatever is painted next. A 3 Tr title off the page
+    // is still removed, and so is ordinary text off the page.
+    let off = b"q BT 7 Tr /F1 10 Tf -500 400 Td (OFFMASK) Tj ET 0 0 1 rg -520 390 200 30 re f Q q BT 3 Tr /F1 10 Tf -500 300 Td (OFFHIDDEN) Tj ET Q q BT /F1 10 Tf -500 200 Td (OFFPLAIN) Tj ET Q";
+    let mut doc = one_page(off, "", Vec::new());
+    let counts: std::collections::HashMap<Hidden, usize> = scan(&doc).into_iter().collect();
+    assert_eq!(counts[&Hidden::HiddenText], 9 + 8, "the 3 Tr and the plain title off the page, not the clipping one");
+    let done = remove_hidden(&mut doc, &[Hidden::HiddenText]).unwrap();
+    assert_eq!(done, [(Hidden::HiddenText, 17)]);
+    let c = content(&doc, 0);
+    assert!(c.contains("(OFFMASK)"), "the off-page clipping title is kept, so its fill stays clipped: {c}");
+    assert!(!c.contains("(OFFHIDDEN)") && !c.contains("(OFFPLAIN)"), "{c}");
 }
 
 #[test]

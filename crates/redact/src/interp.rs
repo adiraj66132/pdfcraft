@@ -1182,10 +1182,16 @@ fn show(scope: &Scope<'_>, gs: &Gs, tm: &mut Matrix, items: &[Object]) -> (Vec<O
                         //
                         // A 7 Tr object with nothing painted after it is invisible and is now
                         // left alone too. Keeping it costs nothing on the page, which is the
-                        // trade the report asks for ("pages 2 and 3 may lose their title").
+                        // trade the report asks for ("pages 2 and 3 may lose their title"). The
+                        // same holds for a 7 Tr glyph off the page, which the off-page rule below
+                        // would otherwise take.
                         Some(page) => {
                             let degenerate = b[2] - b[0] < 0.01 && b[3] - b[1] < 0.01;
-                            gs.render_mode == 3 || !(overlaps(page, b, 0.0) || degenerate)
+                            // Off the page is no reason to drop a clipping glyph either: the
+                            // clip is set by the text object as a whole, so removing the glyphs
+                            // that happen to lie outside the page widens it -- and removing all
+                            // of them sets none at all, which is the flood again.
+                            gs.render_mode == 3 || (gs.render_mode != 7 && !(overlaps(page, b, 0.0) || degenerate))
                         }
                         None => scope.glyph_hit(b, origin),
                     };
