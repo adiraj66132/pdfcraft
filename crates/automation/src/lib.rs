@@ -2098,6 +2098,28 @@ impl Automation {
             .collect()
     }
 
+    /// Page text with every layer visible, for redaction's search. [`Self::page_texts`] returns
+    /// what the renderer shows, which leaves out content on a layer that is off -- so a search
+    /// for a word to redact never found it there, the user was told every match was marked, and
+    /// the word stayed in the saved file (#3646). Applying a mark already removes hidden content:
+    /// only the search missed it.
+    ///
+    /// Not cached. The text cache holds what Find sees, and this is deliberately different.
+    fn page_texts_every_layer(&mut self, id: DocId, pages: &[usize]) -> Result<Vec<Arc<PageText>>> {
+        let doc = self.session.get(id).ok_or_else(|| failed("no such document"))?;
+        let n = doc.info.pages.len();
+        if let Some(p) = pages.iter().find(|p| **p >= n) {
+            return Err(failed(format!("page {} is out of range", p + 1)));
+        }
+        let on: Vec<(i32, i32, bool)> = doc.info.layers.iter().map(|l| (l.id.0 as i32, i32::from(l.id.1), true)).collect();
+        let bytes = doc.bytes.clone();
+        let password: Option<Arc<str>> = doc.password.as_deref().map(Arc::from);
+        extract_with_layers(&bytes, password, pages, Arc::new(on))
+            .into_iter()
+            .map(|(p, text)| text.map_err(|e| failed(format!("page {}: {e}", p + 1))))
+            .collect()
+    }
+
     /// Keep per-page failures until the caller chooses strict or partial-result semantics.
     fn page_text_results(
         &mut self,
@@ -2735,6 +2757,13 @@ fn encode_png(width: u32, height: u32, premultiplied: &[u8]) -> Result<Vec<u8>> 
 
 /// Extract the text of `pages` (0-based) with one renderer per worker thread.
 fn extract_parallel(bytes: &Arc<Vec<u8>>, password: Option<Arc<str>>, pages: &[usize]) -> PageTexts {
+    extract_with_layers(bytes, password, pages, Arc::new(Vec::new()))
+}
+
+/// [`extract_parallel`] with layer (optional content group) visibility overrides, so a caller can
+/// read text the renderer would leave out. Redaction's search uses it; see
+/// [`Session::page_texts_every_layer`].
+fn extract_with_layers(bytes: &Arc<Vec<u8>>, password: Option<Arc<str>>, pages: &[usize], layers: Arc<Vec<(i32, i32, bool)>>) -> PageTexts {
     let extract = |r: &mut PageRenderer, p: usize| {
         let out = r.render(RenderRequest { page: p, kind: RequestKind::Text, tile: None, scale: 1.0, tag: 0, preview: false });
         match out.error {
@@ -2742,7 +2771,7 @@ fn extract_parallel(bytes: &Arc<Vec<u8>>, password: Option<Arc<str>>, pages: &[u
             None => Ok(out.text.unwrap_or_default()),
         }
     };
-    let config = RenderConfig { password, ..Default::default() };
+    let config = RenderConfig { password, layers, ..Default::default() };
     let workers = if cfg!(target_arch = "wasm32") { 1 } else { std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get).min(8) };
     // Small jobs aren't worth a second parse of the document.
     if workers == 1 || pages.len() < 8 {
