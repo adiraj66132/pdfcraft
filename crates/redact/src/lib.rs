@@ -496,7 +496,7 @@ fn apply_to(doc: &mut Document, pages: Option<&[usize]>) -> Result<Report, Redac
             )?;
             // A pattern this page selected but no surviving paint draws leaves its resources, so
             // its cell -- a content stream this pass does not enter -- cannot stay in the file.
-            report.patterns_removed += interp::prune_patterns(&mut res, &out.patterns_seen, &out.patterns_painted);
+            report.patterns_removed += interp::prune_patterns(doc, &mut res, &out.patterns_seen, &out.patterns_painted);
             retired_properties.extend(interp::prune_properties(doc, &mut res, &cleaned_data)?);
             doc.update_dict(page.obj, |d| {
                 d.set(b"Contents".to_vec(), Object::Array(new_list));

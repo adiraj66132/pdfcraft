@@ -448,13 +448,31 @@ pub(crate) fn prune(xo: &mut Dict, replaced: &[Vec<u8>], content: &[Vec<u8>]) {
     }
 }
 
+/// Record the patterns an operator paints with, so [`prune_patterns`] keeps them. Only path
+/// painting knows exactly what it draws and whether the paint survived; text, images and forms
+/// are recorded as they are met, which can keep a pattern whose paint was in fact all redacted.
+/// That costs an unused resource entry, while dropping a pattern something still draws with
+/// loses paint from the page.
+fn uses_patterns(out: &mut Output, gs: &Gs, fills: bool, strokes: bool) {
+    if fills && let Some(n) = &gs.fill_pattern {
+        out.patterns_painted.push(n.clone());
+    }
+    if strokes && let Some(n) = &gs.stroke_pattern {
+        out.patterns_painted.push(n.clone());
+    }
+}
+
 /// Drop every `/Pattern` entry this scope saw selected but no surviving painting operator drew
 /// with, and the `scn` that selected it. A pattern's cell is a content stream of its own which
 /// this pass does not enter, so a pattern whose only painting was redacted would otherwise keep
 /// its drawing -- text included -- in the saved file (#3647). A pattern some surviving paint
 /// still uses, or one the scope never saw, is left alone.
-pub(crate) fn prune_patterns(res: &mut Dict, seen: &[Vec<u8>], painted: &[Vec<u8>]) -> usize {
-    let Some(mut pat) = res.get(b"Pattern").and_then(Object::as_dict).cloned() else { return 0 };
+/// `/Pattern` may be an indirect object like any other value, so it is resolved: reading the
+/// reference itself as a dictionary found none and pruned nothing, leaving the cell in the file.
+/// What is written back is a dictionary of this page's own, so pruning never reaches through a
+/// `/Pattern` dictionary another page shares.
+pub(crate) fn prune_patterns(doc: &Document, res: &mut Dict, seen: &[Vec<u8>], painted: &[Vec<u8>]) -> usize {
+    let Some(mut pat) = res.get(b"Pattern").map(|p| doc.resolve(p)).and_then(|p| p.as_dict().cloned()) else { return 0 };
     let mut dropped = 0;
     for n in seen {
         if !painted.contains(n) && pat.get(n).is_some() {
@@ -919,17 +937,9 @@ fn process_from(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<u8>], 
                 // The pattern this paint draws with is still in use wherever the paint survives,
                 // whole or clipped. `n` paints nothing, so it uses none.
                 let paints_pattern = |out: &mut Output| {
-                    if o == b"n" {
-                        return;
-                    }
                     let strokes = matches!(o, b"S" | b"s" | b"B" | b"B*" | b"b" | b"b*");
                     let fills = matches!(o, b"f" | b"F" | b"f*" | b"B" | b"B*" | b"b" | b"b*");
-                    if fills && let Some(n) = &gs.fill_pattern {
-                        out.patterns_painted.push(n.clone());
-                    }
-                    if strokes && let Some(n) = &gs.stroke_pattern {
-                        out.patterns_painted.push(n.clone());
-                    }
+                    uses_patterns(out, &gs, fills, strokes);
                 };
                 if !hit {
                     paints_pattern(&mut out);
@@ -1066,6 +1076,9 @@ fn process_from(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<u8>], 
                     tm = tlm;
                 }
                 b"Tj" | b"TJ" | b"'" | b"\"" => {
+                    // Text paints with the fill pattern, and with the stroke pattern in the
+                    // stroking render modes. Mode 3 paints nothing and mode 7 only clips.
+                    uses_patterns(&mut out, &gs, matches!(gs.render_mode, 0 | 2 | 4 | 6), matches!(gs.render_mode, 1 | 2 | 5 | 6));
                     if o == b"\"" {
                         gs.word_spacing = op.num(0).unwrap_or(gs.word_spacing);
                         gs.char_spacing = op.num(1).unwrap_or(gs.char_spacing);
@@ -1118,6 +1131,8 @@ fn process_from(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<u8>], 
                     continue;
                 }
                 b"BI" => {
+                    // An image mask paints with the fill colour, pattern included.
+                    uses_patterns(&mut out, &gs, true, false);
                     let b = gs.ctm.bbox([0.0, 0.0, 1.0, 1.0]);
                     if scope.hits(b) {
                         if scope.mode == Mode::Verify {
@@ -1141,6 +1156,10 @@ fn process_from(doc: &mut Document, scope: &mut Scope<'_>, streams: &[Vec<u8>], 
                     }
                 }
                 b"Do" => {
+                    // An image mask paints with the fill colour, and a form's content is
+                    // interpreted with a graphics state of its own, so a pattern it inherits
+                    // from here is never recorded inside it.
+                    uses_patterns(&mut out, &gs, true, true);
                     if let Some(new) = xobject(doc, scope, &op, &gs, resources, &mut xobjects, &mut out) {
                         changed = true;
                         if let Some(n) = new {
