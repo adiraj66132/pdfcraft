@@ -58,13 +58,19 @@ fn has_decoded_secret(bytes: Vec<u8>) -> bool {
 
 /// Success must remove the payload from the saved object graph. Refusal must be atomic even
 /// for the direct library caller, not just the engine's working clone.
-fn assert_confidential_or_refused(mut doc: Document) {
+fn assert_confidential_or_refused(mut doc: Document, expect_refusal: bool) {
     mark(&mut doc, 0);
     let before = saved(&doc);
     assert!(has_decoded_secret(before.clone()), "the fixture must carry the secret");
     match apply(&mut doc, None) {
-        Ok(_) => assert!(!has_decoded_secret(saved(&doc)), "successful redaction retained the pattern cell's secret in the saved PDF"),
-        Err(_) => {
+        Ok(report) => {
+            assert!(!expect_refusal, "a retained text-bearing cell must refuse");
+            assert_eq!(report.patterns_removed, 1);
+            assert!(!has_decoded_secret(saved(&doc)), "successful redaction retained the pattern cell's secret in the saved PDF");
+        }
+        Err(error) => {
+            assert!(expect_refusal, "a fully removed pattern should apply: {error}");
+            assert!(matches!(error, RedactError::Pattern { reason: PatternProblem::Content, .. }), "{error}");
             assert_eq!(saved(&doc), before, "a refused pattern must leave the entire document unchanged");
             assert_eq!(marks(&doc).len(), 1, "the pending mark must survive refusal");
         }
@@ -74,7 +80,7 @@ fn assert_confidential_or_refused(mut doc: Document) {
 #[test]
 fn pattern_whole_fill_saved_output_is_confidential_or_refused() {
     for compressed in [false, true] {
-        assert_confidential_or_refused(fixture(CELL, compressed, false, false));
+        assert_confidential_or_refused(fixture(CELL, compressed, false, false), false);
     }
 }
 
@@ -82,13 +88,13 @@ fn pattern_whole_fill_saved_output_is_confidential_or_refused() {
 fn pattern_partial_fill_saved_output_is_confidential_or_refused() {
     let cell = [CELL, b"BT /F1 20 Tf 300 120 Td (SAFE) Tj ET\n"].concat();
     for compressed in [false, true] {
-        assert_confidential_or_refused(fixture(&cell, compressed, true, false));
+        assert_confidential_or_refused(fixture(&cell, compressed, true, false), true);
     }
 }
 
 #[test]
 fn pattern_inherited_resources_saved_output_is_confidential_or_refused() {
-    assert_confidential_or_refused(fixture(CELL, true, false, true));
+    assert_confidential_or_refused(fixture(CELL, true, false, true), false);
 }
 
 #[test]
@@ -107,6 +113,57 @@ fn pattern_vector_only_control_still_applies_and_preserves_the_cell() {
     let pattern = reopened.resolve(patterns.get(b"P0").unwrap());
     let Object::Stream(pattern) = &*pattern else { panic!("pattern must be preserved") };
     assert_eq!(pattern.decoded().unwrap(), cell);
+}
+
+#[test]
+fn unrelated_font_widths_do_not_exhaust_pattern_budget() {
+    let mut doc = fixture(b"40 120 15 15 re f\n", false, true, false);
+    doc.update_dict(ObjRef::new(4, 0), |font| {
+        font.set(b"W".to_vec(), Object::Array(vec![Object::Int(500); 17_000]));
+    })
+    .unwrap();
+    mark(&mut doc, 0);
+    assert_eq!(apply(&mut doc, None).unwrap().marks, 1);
+}
+
+#[test]
+fn shared_annotation_appearance_on_unselected_page_is_refused() {
+    let mut doc = two_pages();
+    let pages = pdfcraft_model::pages(&doc);
+    for page in &pages {
+        let mut resources = doc.dict(page.dict.get(b"Resources").unwrap()).unwrap();
+        resources.remove(b"Pattern");
+        doc.update_dict(page.obj, |dict| dict.set(b"Resources".to_vec(), Object::Dict(resources.clone()))).unwrap();
+    }
+    let ap = doc.add(Object::Stream(Stream::from_raw(
+        Dict::from_iter([
+            (b"Subtype".to_vec(), Object::name("Form")),
+            (b"BBox".to_vec(), Object::Array(vec![0.into(), 0.into(), 500.into(), 300.into()])),
+            (
+                b"Resources".to_vec(),
+                Object::Dict(Dict::from_iter([(
+                    b"Pattern".to_vec(),
+                    Object::Dict(Dict::from_iter([(b"P0".to_vec(), Object::Ref(ObjRef::new(6, 0)))])),
+                )])),
+            ),
+        ]),
+        b"/Pattern cs /P0 scn 35 110 170 35 re f".to_vec(),
+    )));
+    for page in pages {
+        let annotation = doc.add(Object::Dict(Dict::from_iter([
+            (b"Type".to_vec(), Object::name("Annot")),
+            (b"Subtype".to_vec(), Object::name("Stamp")),
+            (b"Rect".to_vec(), Object::Array(vec![30.into(), 105.into(), 215.into(), 150.into()])),
+            (b"AP".to_vec(), Object::Dict(Dict::from_iter([(b"N".to_vec(), Object::Ref(ap))]))),
+        ])));
+        doc.update_dict(page.obj, |dict| dict.set(b"Annots".to_vec(), Object::Array(vec![Object::Ref(annotation)]))).unwrap();
+    }
+    mark(&mut doc, 0);
+    let before = saved(&doc);
+    let error = apply(&mut doc, Some(&[0])).unwrap_err();
+    assert_eq!(error, RedactError::Pattern { page: 2, reason: PatternProblem::Content });
+    assert_eq!(saved(&doc), before);
+    assert_eq!(marks(&doc).len(), 1);
 }
 
 #[test]

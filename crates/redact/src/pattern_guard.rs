@@ -1,7 +1,7 @@
 //! Refuse pattern content that remains reachable after redaction (#3647).
 //!
 //! Pattern cells paint through a path, not `Do`, so clipping/removing the path does not remove
-//! their bytes. Inspect the rewritten selected pages' resource graphs before committing the
+//! their bytes. Inspect the rewritten pages' resource graphs before committing the
 //! working copy. This is deliberately conservative: an unused text/image-bearing pattern is
 //! refused too. A plain vector pattern remains supported. The bounded read-only pass follows
 //! the fail-closed approach proposed in PR #162.
@@ -104,7 +104,7 @@ impl Guard {
         for (key, value) in dict.iter() {
             if owns_resources && key.as_slice() == b"Resources" {
                 self.resources(doc, value, inside, depth + 1)?;
-            } else {
+            } else if inside || !owns_resources {
                 self.walk(doc, value, inside, depth + 1)?;
             }
         }
@@ -121,6 +121,26 @@ impl Guard {
         }
         let Some(resources) = object.as_dict() else { return Err(PatternProblem::Unreadable) };
         for (category, value) in resources.iter() {
+            // Resource dictionaries may include large embedded fonts and colour tables. Only
+            // structures that can own another pattern cell need recursive inspection.
+            if !matches!(category.as_slice(), b"Pattern" | b"XObject" | b"Font" | b"Properties" | b"ExtGState") {
+                continue;
+            }
+            if category.as_slice() == b"Font" {
+                let fonts = resolved(doc, Some(value))?;
+                let Some(fonts) = fonts.as_dict() else { return Err(PatternProblem::Unreadable) };
+                for (_, font) in fonts.iter() {
+                    self.charge(depth)?;
+                    let font = resolved(doc, Some(font))?;
+                    let Some(dict) = font.as_dict() else { return Err(PatternProblem::Unreadable) };
+                    if resolved(doc, dict.get(b"Subtype"))?.as_name() == Some(b"Type3")
+                        && let Some(resources) = dict.get(b"Resources")
+                    {
+                        self.resources(doc, resources, inside, depth + 1)?;
+                    }
+                }
+                continue;
+            }
             if matches!(category.as_slice(), b"Pattern" | b"XObject" | b"Properties" | b"ExtGState") && resolved(doc, Some(value))? == Object::Null {
                 continue;
             }
@@ -149,7 +169,7 @@ impl Guard {
                     self.walk(doc, pattern, true, depth + 1)?;
                 }
             } else {
-                if inside && matches!(category.as_slice(), b"XObject" | b"Properties" | b"ExtGState") {
+                if (inside && matches!(category.as_slice(), b"XObject" | b"Properties")) || category.as_slice() == b"ExtGState" {
                     let object = resolved(doc, Some(value))?;
                     let Some(entries) = object.as_dict() else { return Err(PatternProblem::Unreadable) };
                     for (_, entry) in entries.iter() {
@@ -170,6 +190,9 @@ impl Guard {
                                     let group = resolved(doc, mask.get(b"G"))?;
                                     let Object::Stream(group) = group else { return Err(PatternProblem::Unreadable) };
                                     readable_form(doc, &group)?;
+                                    if let Some(value) = mask.get(b"G") {
+                                        self.walk(doc, value, inside, depth + 1)?;
+                                    }
                                 }
                                 _ => return Err(PatternProblem::Unreadable),
                             }
@@ -183,7 +206,19 @@ impl Guard {
                         }
                     }
                 }
-                self.walk(doc, value, inside, depth + 1)?;
+                if category.as_slice() == b"XObject" {
+                    let entries = resolved(doc, Some(value))?;
+                    let Some(entries) = entries.as_dict() else { return Err(PatternProblem::Unreadable) };
+                    for (_, entry) in entries.iter() {
+                        self.charge(depth)?;
+                        let object = resolved(doc, Some(entry))?;
+                        if let Object::Stream(stream) = object
+                            && resolved(doc, stream.dict.get(b"Subtype"))?.as_name() == Some(b"Form")
+                        {
+                            self.walk(doc, entry, inside, depth + 1)?;
+                        }
+                    }
+                }
             }
         }
         Ok(())
@@ -314,7 +349,7 @@ fn normalized_stream(doc: &Document, stream: &Stream) -> Result<Stream, PatternP
     Ok(normalized)
 }
 
-/// Validate the rewritten selected pages before `apply` commits its working copy.
+/// Validate the requested pages before `apply` commits its working copy.
 pub(crate) fn check(doc: &Document, selected: &[usize]) -> Result<(), RedactError> {
     let pages = pdfcraft_model::pages(doc);
     for &index in selected {

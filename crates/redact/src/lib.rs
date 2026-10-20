@@ -365,6 +365,38 @@ fn localize_resources(doc: &mut Document, selected: &[usize]) -> Result<(), pdfc
     Ok(())
 }
 
+// Shared appearance stream references can keep a removed annotation's pattern cell reachable
+// from an unselected page. Collect only the appearance map and its state streams, not unrelated
+// annotation data such as fonts or metadata.
+fn appearance_refs(doc: &Document, annotation: &Dict) -> Option<HashSet<ObjRef>> {
+    const MAX_REFERENCES: usize = 16_384;
+    let mut references = HashSet::new();
+    let Some(ap) = annotation.get(b"AP") else { return Some(references) };
+    if let Some(reference) = ap.as_ref() {
+        references.insert(reference);
+    }
+    let resolved_ap = doc.resolve(ap);
+    let Some(appearances) = resolved_ap.as_dict() else { return Some(references) };
+    for key in [b"N".as_slice(), b"R", b"D"] {
+        let Some(value) = appearances.get(key) else { continue };
+        if let Some(reference) = value.as_ref() {
+            references.insert(reference);
+        }
+        let resolved = doc.resolve(value);
+        if let Object::Dict(states) = &*resolved {
+            for (_, state) in states.iter() {
+                if let Some(reference) = state.as_ref() {
+                    references.insert(reference);
+                    if references.len() > MAX_REFERENCES {
+                        return None;
+                    }
+                }
+            }
+        }
+    }
+    Some(references)
+}
+
 /// Apply every redaction mark (or only those on `pages`, 0-based). Irreversible for the saved
 /// file; callers keep the previous document for undo.
 ///
@@ -433,6 +465,8 @@ fn apply_to(doc: &mut Document, pages: Option<&[usize]>) -> Result<Report, Redac
         pdfcraft_forms::fields(doc).into_iter().flat_map(|f| f.widgets.iter().map(|w| (w.obj, f.obj)).collect::<Vec<_>>()).collect();
     let listed_before = listed_annotations(doc);
     let mut removed_everywhere: HashSet<ObjRef> = HashSet::new();
+    let mut removed_appearances = HashSet::new();
+    let mut appearance_scan_limit = false;
 
     for &(pi, page_marks) in &groups {
         let page = pdfcraft_model::pages(doc).swap_remove(pi);
@@ -594,6 +628,22 @@ fn apply_to(doc: &mut Document, pages: Option<&[usize]>) -> Result<Report, Redac
                 removed_everywhere.insert(r);
             }
         }
+        for reference in &removed {
+            if appearance_scan_limit {
+                break;
+            }
+            if let Some(annotation) = doc.get(*reference).as_dict() {
+                if let Some(references) = appearance_refs(doc, annotation) {
+                    removed_appearances.extend(references);
+                    if removed_appearances.len() > 16_384 {
+                        appearance_scan_limit = true;
+                        removed_appearances.clear();
+                    }
+                } else {
+                    appearance_scan_limit = true;
+                }
+            }
+        }
         let kept: Vec<Object> = annots
             .into_iter()
             .filter(|a| {
@@ -716,9 +766,20 @@ fn apply_to(doc: &mut Document, pages: Option<&[usize]>) -> Result<Report, Redac
         return Err(RedactError::Residue(residue));
     }
     // The interpreter can remove a pattern's paint while another use keeps the cell reachable.
-    // Inspect the finished selected pages, including rewritten Forms, before publishing the
-    // working copy. Unreadable or text/image-bearing retained cells must refuse the redaction.
-    let check_pages = if shared_pattern_possible { (0..pdfcraft_model::pages(doc).len()).collect::<Vec<_>>() } else { by_page };
+    // Inspect the finished selected pages, including rewritten Forms, and all pages if a removed
+    // pattern or appearance may still be shared. Retained unsafe cells refuse the redaction.
+    let shared_appearance_possible = appearance_scan_limit
+        || !removed_appearances.is_empty()
+            && pdfcraft_model::pages(doc).iter().enumerate().any(|(index, page)| {
+                !by_page.contains(&index)
+                    && annots_of(doc, &page.dict).iter().any(|annotation| {
+                        doc.resolve(annotation).as_dict().is_some_and(|dict| {
+                            appearance_refs(doc, dict).is_none_or(|refs| refs.iter().any(|reference| removed_appearances.contains(reference)))
+                        })
+                    })
+            });
+    let check_pages =
+        if shared_pattern_possible || shared_appearance_possible { (0..pdfcraft_model::pages(doc).len()).collect::<Vec<_>>() } else { by_page };
     if let Err(error) = pattern_guard::check(doc, &check_pages) {
         *doc = before_pattern_check;
         return Err(error);
