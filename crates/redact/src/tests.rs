@@ -1305,45 +1305,62 @@ fn hidden_fixture() -> Document {
     doc
 }
 
-/// Text in clip-only mode (`7 Tr`) is not hidden text. Those glyphs paint nothing themselves, but
-/// they are the clipping path for whatever is painted until the enclosing `Q`, so a title drawn
-/// that way and then filled is visible -- seen through the letters. Removing the glyphs left a
-/// text object showing none, so no clip was set and the fill flooded its whole rectangle: the
-/// title became a solid box (#3644, the same flood as #3123 through a third entry point).
+/// Text in a clipping mode (`7 Tr`) paints nothing itself, so it is hidden from the eye while
+/// staying extractable and searchable: Remove Hidden Information takes it, as it takes `3 Tr`
+/// text. What it must not do is leave the page flooded.
+///
+/// Those glyphs are the clipping path for whatever is painted until the enclosing `Q`, so a title
+/// drawn that way and then filled is seen through the letters. Taking the glyphs leaves the clip
+/// the text object set **empty**, and readers disagree about an empty text clip -- CoreGraphics
+/// admits nothing through it, pdf.js admits everything (measured on #3451) -- so the fill painted
+/// its whole rectangle and the title became a solid box (#3644).
+///
+/// The rewrite says it with a path instead: an empty clip after the `ET`, which every reader
+/// honours. The title is lost, which the issue allows ("pages 2 and 3 may lose their title"), and
+/// nothing floods.
 #[test]
-fn clip_only_text_is_not_hidden_text() {
+fn clip_only_text_is_removed_and_what_it_masked_is_not_flooded() {
     use crate::sanitize::{Hidden, remove_hidden, scan};
     // A 7 Tr title with a fill painted through it, a 7 Tr title with nothing after it, and a
-    // 3 Tr title, which is the genuinely hidden one.
+    // 3 Tr title, which is hidden in the ordinary way.
     let stream = b"q BT 7 Tr /F1 10 Tf 10 200 Td (MASK) Tj ET 1 0 0 rg 5 195 90 20 re f Q q BT 7 Tr /F1 10 Tf 10 150 Td (BARE) Tj ET Q q BT 3 Tr /F1 10 Tf 10 100 Td (GONE) Tj ET Q BT /F1 10 Tf 10 50 Td (AFTER) Tj ET";
     let mut doc = one_page(stream, "", Vec::new());
 
-    // Only the invisible title is counted: four glyphs, not twelve.
+    // All three titles are hidden text: 4 + 4 + 4 glyphs. The dialog says so before removing.
     let counts: std::collections::HashMap<Hidden, usize> = scan(&doc).into_iter().collect();
-    assert_eq!(counts[&Hidden::HiddenText], 4, "only the 3 Tr title is hidden text");
+    assert_eq!(counts[&Hidden::HiddenText], 12, "the two clipping titles and the invisible one");
 
     let done = remove_hidden(&mut doc, &[Hidden::HiddenText]).unwrap();
-    assert_eq!(done, [(Hidden::HiddenText, 4)]);
+    assert_eq!(done, [(Hidden::HiddenText, 12)]);
     let c = content(&doc, 0);
-    // The clipping titles and the visible line stay; the invisible one goes.
-    assert!(c.contains("(MASK)"), "the clipping title is kept, so its fill is still masked: {c}");
-    assert!(c.contains("(BARE)"), "a clipping title with nothing painted after it is kept too: {c}");
-    assert!(!c.contains("(GONE)"), "the 3 Tr title is removed: {c}");
+    // Not one of the three is left in the file; the visible line is.
+    for gone in ["(MASK)", "(BARE)", "(GONE)"] {
+        assert!(!c.contains(gone), "{gone} is still in the page: {c}");
+    }
     assert!(c.contains("(AFTER)"), "{c}");
+    // Each emptied clipping text object says "nothing paints through me" in a way every reader
+    // honours, and the fill that used to be masked is still in the file, now clipped away.
+    assert_eq!(c.matches("0 0 0 0 re\nW\nn").count(), 2, "an empty clip for each emptied clipping object: {c}");
+    let (et, fill) = (c.find("ET\n0 0 0 0 re").expect("the clip follows the ET"), c.find("5 195 90 20 re").expect("the fill"));
+    assert!(et < fill, "the clip comes before the fill it masks: {c}");
 
-    // Nor does being off the page make a clipping glyph hidden text. The clip is set by the text
-    // object as a whole, so taking the glyphs outside the page widens it -- and taking all of
-    // them sets no clip at all, which floods whatever is painted next. A 3 Tr title off the page
-    // is still removed, and so is ordinary text off the page.
-    let off = b"q BT 7 Tr /F1 10 Tf -500 400 Td (OFFMASK) Tj ET 0 0 1 rg -520 390 200 30 re f Q q BT 3 Tr /F1 10 Tf -500 300 Td (OFFHIDDEN) Tj ET Q q BT /F1 10 Tf -500 200 Td (OFFPLAIN) Tj ET Q";
+    // Off the page is the same: the glyphs go, and what they masked does not flood.
+    let off = b"q BT 7 Tr /F1 10 Tf -500 400 Td (OFFMASK) Tj ET 0 0 1 rg -520 390 200 30 re f Q q BT /F1 10 Tf -500 200 Td (OFFPLAIN) Tj ET Q";
     let mut doc = one_page(off, "", Vec::new());
-    let counts: std::collections::HashMap<Hidden, usize> = scan(&doc).into_iter().collect();
-    assert_eq!(counts[&Hidden::HiddenText], 9 + 8, "the 3 Tr and the plain title off the page, not the clipping one");
     let done = remove_hidden(&mut doc, &[Hidden::HiddenText]).unwrap();
-    assert_eq!(done, [(Hidden::HiddenText, 17)]);
+    assert_eq!(done, [(Hidden::HiddenText, 7 + 8)]);
     let c = content(&doc, 0);
-    assert!(c.contains("(OFFMASK)"), "the off-page clipping title is kept, so its fill stays clipped: {c}");
-    assert!(!c.contains("(OFFHIDDEN)") && !c.contains("(OFFPLAIN)"), "{c}");
+    assert!(!c.contains("(OFFMASK)") && !c.contains("(OFFPLAIN)"), "{c}");
+    assert_eq!(c.matches("0 0 0 0 re\nW\nn").count(), 1, "{c}");
+
+    // A clipping object that keeps a glyph keeps its clip as it was: no empty clip is added.
+    let kept = b"q BT 7 Tr /F1 10 Tf 10 200 Td (KEEP) Tj 3 Tr (HIDE) Tj ET 1 0 0 rg 5 195 90 20 re f Q";
+    let mut doc = one_page(kept, "", Vec::new());
+    let done = remove_hidden(&mut doc, &[Hidden::HiddenText]).unwrap();
+    assert_eq!(done, [(Hidden::HiddenText, 8)], "both runs are hidden text");
+    let c = content(&doc, 0);
+    assert!(!c.contains("(KEEP)") && !c.contains("(HIDE)"), "{c}");
+    assert_eq!(c.matches("0 0 0 0 re\nW\nn").count(), 1, "the object lost every clipping glyph: {c}");
 }
 
 #[test]
