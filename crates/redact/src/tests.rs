@@ -461,6 +461,56 @@ fn a_pattern_whose_only_painting_was_redacted_leaves_the_page() {
     assert!(!saved.windows(8).any(|w| w == b"(SECRET)"), "the cell's text is gone from the saved file");
 }
 
+/// Pruning takes the pattern out of `/Resources` but leaves the `/P0 scn` that selected it, so
+/// the saved page names a pattern that is no longer there. ISO 32000-1 (8.6.6.2) says that
+/// operand is a key of the `/Pattern` subdictionary, so this is what a reader is handed: the
+/// question is whether it stops reading the stream there. Asked in the review of #3647.
+#[test]
+fn a_page_whose_pruned_pattern_is_still_selected_renders() {
+    let cell = stream(
+        "/Type /Pattern /PatternType 1 /PaintType 1 /TilingType 1 /BBox [0 0 300 300] /XStep 300 /YStep 300 /Resources << /Font << /F1 5 0 R >> >>",
+        b"BT /F1 10 Tf 10 150 Td (SECRET) Tj ET",
+    );
+    // `0 g` after the fill puts the text back on a plain colour: with the pattern still selected
+    // the text would paint with it, and a pattern something still paints with is never pruned.
+    // The text is *after* the selector on purpose -- that is what a reader would lose if it gave
+    // up on the stale `/P0`.
+    let content_stream = b"/Pattern cs /P0 scn 20 140 100 30 re f 0 g BT /F1 24 Tf 10 40 Td (PUBLIC) Tj ET";
+    let mut doc = one_page(content_stream, "/Pattern << /P0 7 0 R >>", vec![cell]);
+    mark(&mut doc, 0, &[[15.0, 135.0, 130.0, 175.0]], "");
+    assert_eq!(apply(&mut doc, None).unwrap().patterns_removed, 1, "the pattern is pruned");
+
+    // The state this test is about: the selector outlived the resource it names.
+    let after = content(&doc, 0);
+    assert!(after.contains("/P0 scn"), "the selector is still in the content: {after}");
+    assert!(!after.contains("20 140 100 30 re"), "the fill that used it is gone: {after}");
+
+    let bytes = write_full(&doc, &SaveOptions::default()).unwrap();
+    assert!(!bytes.windows(8).any(|w| w == b"(SECRET)"), "the cell's text is gone from the saved file");
+    let mut r = pdfcraft_render::PageRenderer::new(std::sync::Arc::new(bytes), pdfcraft_render::RenderConfig::default());
+    let out = r.render(pdfcraft_render::RenderRequest { page: 0, scale: 1.0, ..Default::default() });
+    assert!(out.error.is_none(), "the page still renders: {:?}, warnings {:?}", out.error, out.warnings);
+    assert_eq!((out.width, out.height), (300, 300), "the page box is unchanged");
+
+    // The text after the stale selector is still drawn: 24 pt at y 40, so the top-left origin
+    // puts it in the rows around 240..265. Without it the reader gave up at the bad operand.
+    let painted = |rows: std::ops::Range<u32>, cols: std::ops::Range<u32>| {
+        rows.flat_map(|y| cols.clone().map(move |x| (y, x))).any(|(y, x)| {
+            let i = ((y * out.width + x) * 4) as usize;
+            out.rgba[i..i + 3] != [255, 255, 255]
+        })
+    };
+    assert!(painted(236..268, 8..120), "the text after the stale selector is still painted");
+    // The mark itself is drawn over the area the pattern filled -- `apply` writes a black
+    // overlay there (`q 0 0 0 rg 15 135 115 40 re f Q`), so the cell cannot show through it
+    // even if a reader kept the stale selector.
+    let black = |y: u32, x: u32| {
+        let i = ((y * out.width + x) * 4) as usize;
+        out.rgba[i..i + 3] == [0, 0, 0]
+    };
+    assert!(black(145, 70), "the redaction overlay is painted over the pattern's box");
+}
+
 #[test]
 fn redaction_cannot_leave_hidden_cell_text_when_pattern_is_used_elsewhere() {
     let cell = stream(

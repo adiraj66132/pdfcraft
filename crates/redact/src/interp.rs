@@ -463,7 +463,10 @@ fn uses_patterns(out: &mut Output, gs: &Gs, fills: bool, strokes: bool) {
 }
 
 /// Drop every `/Pattern` entry this scope saw selected but no surviving painting operator drew
-/// with, and the `scn` that selected it. A pattern's cell is a content stream of its own which
+/// with. The `scn` that selected it stays in the content, so the page names a pattern its
+/// resources no longer hold; nothing surviving paints with that colour, and
+/// `a_page_whose_pruned_pattern_is_still_selected_renders` pins that the page still renders and
+/// that operators after the stale selector still draw. A pattern's cell is a content stream of its own which
 /// this pass does not enter, so a pattern whose only painting was redacted would otherwise keep
 /// its drawing -- text included -- in the saved file (#3647). A pattern some surviving paint
 /// still uses, or one the scope never saw, is left alone.
