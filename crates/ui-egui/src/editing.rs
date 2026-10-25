@@ -575,8 +575,9 @@ impl PdfCraftApp {
     }
 
     /// A comment being typed is posted into the document before the file is written, so Close ▸
-    /// Save keeps it instead of dropping it (#3918). A draft the document refuses goes back into
-    /// the view: typed text is never lost behind a failed save.
+    /// Save keeps it instead of dropping it (#3918). When the document refuses an edit, that draft
+    /// and every draft still queued behind it go back into the view: typed text is never lost
+    /// behind a failed save.
     fn commit_comment_drafts(&mut self, id: pdfcraft_engine::DocId) -> bool {
         /// Which draft an edit was built from, so a refused one can be put back.
         enum Draft {
@@ -595,7 +596,7 @@ impl PdfCraftApp {
         // The edits are collected first: `apply_edit` needs the whole app, so no borrow of the
         // document or the view may still be alive when it runs. Each snapshot is taken before
         // its draft is taken out of the view.
-        let plan: Vec<(Draft, Edit)> = {
+        let mut plan: Vec<(Draft, Edit)> = {
             let Some(doc) = self.session.get(id) else { return true };
             let Some(view) = self.views.get_mut(i) else { return true };
             let prefs = &self.comment_prefs;
@@ -624,16 +625,24 @@ impl PdfCraftApp {
             return true;
         }
         self.active = Some(i);
-        for (from, edit) in plan {
+        while !plan.is_empty() {
+            let (from, edit) = plan.remove(0);
             if self.apply_edit(edit) {
                 continue;
             }
-            let Some(view) = self.views.get_mut(i) else { return false };
-            match from {
-                Draft::Composer(c) if view.comments.composer.is_none() => view.comments.composer = Some(c),
-                Draft::Reply(t) if view.comments.reply.is_empty() => view.comments.reply = t,
-                Draft::AddBox(t) if view.comments.add_box.is_empty() => view.comments.add_box = t,
-                _ => {}
+            // Everything left was taken out of the view when the plan was built and has not been
+            // posted, so all of it goes back -- not only the edit the document refused. Drafts
+            // already applied are not in `plan` any more, so they stay in the document.
+            if let Some(view) = self.views.get_mut(i) {
+                let unposted = std::iter::once(from).chain(plan.drain(..).map(|(left, _)| left));
+                for from in unposted {
+                    match from {
+                        Draft::Composer(c) if view.comments.composer.is_none() => view.comments.composer = Some(c),
+                        Draft::Reply(t) if view.comments.reply.is_empty() => view.comments.reply = t,
+                        Draft::AddBox(t) if view.comments.add_box.is_empty() => view.comments.add_box = t,
+                        _ => {}
+                    }
+                }
             }
             return false;
         }
@@ -1683,6 +1692,23 @@ mod tests {
         assert!(app.has_unsaved_work(0), "a comment in the add box is unsaved work");
         app.views[0].comments.add_box = "  \n".into();
         assert!(!app.has_unsaved_work(0), "an add box with nothing in it is not unsaved work");
+    }
+
+    /// All three drafts are taken out of the view when the plan is built, so a refused edit must
+    /// give back not only itself but the drafts still waiting behind it (#3918).
+    #[test]
+    fn a_refused_comment_draft_keeps_the_drafts_behind_it() {
+        let mut app = crate::PdfCraftApp::new();
+        app.set_option("language", "en").unwrap();
+        app.open_bytes("a.pdf", None, one_page_pdf()).unwrap();
+        // Nothing is selected at that index, so the reply is the edit the document refuses.
+        app.views[0].comments.selected = Some((0, 999));
+        app.views[0].comments.reply = "Typed reply".into();
+        app.views[0].comments.add_box = "Typed add".into();
+        let id = app.views[0].id;
+        assert!(!app.commit_comment_drafts(id), "a reply to a comment that is not there is refused");
+        assert_eq!(app.views[0].comments.reply, "Typed reply", "the refused draft is put back");
+        assert_eq!(app.views[0].comments.add_box, "Typed add", "the draft queued behind it is put back too");
     }
 
     /// Close ▸ Save posts the comments being typed before the file is written: a composer, a
