@@ -2658,7 +2658,6 @@ fn text_comments_can_save_a_zero_width_default() {
     assert_eq!(restored.comment_prefs.style(CommentTool::Callout).width, 0.0);
 }
 
-
 // ── A note typed into a comment card is kept by Save, Close and Quit ────────────────────────────
 
 /// A path in a fresh folder for one test's saved file.
