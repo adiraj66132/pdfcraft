@@ -476,8 +476,10 @@ fn card(
     ui.painter().hline(rect.x_range().shrink(10.0), rect.bottom() + 2.0, Stroke::new(1.0, t.divider));
     ui.add_space(5.0);
     // The header row selects the card (and shows the comment on the page); unselected cards are
-    // clickable everywhere.
-    let hit = if selected { frame.inner } else { rect };
+    // clickable everywhere — except over the note editor this card shows: the card is created
+    // last, so it would win that click, and egui surrenders a focused editor's keyboard when the
+    // click lands anywhere but on it. The note takes its own clicks to keep it (#3125).
+    let hit = if selected || editing { frame.inner } else { rect };
     let click = ui
         .interact(hit, ui.scope_id().with(("card", key)), Sense::click())
         .on_hover_cursor(egui::CursorIcon::PointingHand)
