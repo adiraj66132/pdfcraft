@@ -13,6 +13,9 @@ use pdfcraft_cos::{Dict, Document, ObjRef, Object, Stream};
 use crate::RedactError;
 
 const MAX_DEPTH: usize = 64;
+// Nesting depth counts owning levels, not every hop, so a chain of references would recurse
+// without reaching it. Every walk step passes through `Guard::walk`, which bounds the frames.
+const MAX_FRAMES: usize = 512;
 const MAX_OBJECTS: usize = 16_384;
 const MAX_STREAM_BYTES: usize = 1 << 20;
 const MAX_TOTAL_BYTES: usize = 8 << 20;
@@ -33,11 +36,12 @@ struct Guard {
     bytes_left: usize,
     seen: HashSet<(ObjRef, bool)>,
     active: HashSet<(ObjRef, bool)>,
+    frames: usize,
 }
 
 impl Guard {
     fn new() -> Self {
-        Self { left: MAX_OBJECTS, bytes_left: MAX_TOTAL_BYTES, seen: HashSet::new(), active: HashSet::new() }
+        Self { left: MAX_OBJECTS, bytes_left: MAX_TOTAL_BYTES, seen: HashSet::new(), active: HashSet::new(), frames: 0 }
     }
 
     fn charge(&mut self, depth: usize) -> Result<(), PatternProblem> {
@@ -49,6 +53,17 @@ impl Guard {
     }
 
     fn walk(&mut self, doc: &Document, object: &Object, inside: bool, depth: usize) -> Result<(), PatternProblem> {
+        self.frames += 1;
+        if self.frames > MAX_FRAMES {
+            self.frames -= 1;
+            return Err(PatternProblem::Limit);
+        }
+        let result = self.walk_body(doc, object, inside, depth);
+        self.frames -= 1;
+        result
+    }
+
+    fn walk_body(&mut self, doc: &Document, object: &Object, inside: bool, depth: usize) -> Result<(), PatternProblem> {
         self.charge(depth)?;
         match object {
             Object::Ref(reference) => {
@@ -61,7 +76,9 @@ impl Guard {
                 }
                 let value = doc.try_get(reference.num).map_err(|_| PatternProblem::Unreadable)?;
                 self.active.insert(key);
-                let result = self.walk(doc, &value, inside, depth + 1);
+                // Resolving a reference is not a nesting level: the budget is for how deep a
+                // document nests, and the renderer follows 50 nested forms (#3645).
+                let result = self.walk(doc, &value, inside, depth);
                 self.active.remove(&key);
                 result
             }
@@ -103,7 +120,7 @@ impl Guard {
         let owns_resources = stream || matches!(subtype.as_name(), Some(b"Form" | b"Type3")) || pattern_type.as_int() == Some(1);
         for (key, value) in dict.iter() {
             if owns_resources && key.as_slice() == b"Resources" {
-                self.resources(doc, value, inside, depth + 1)?;
+                self.resources(doc, value, inside, depth)?;
             } else if inside || !owns_resources {
                 self.walk(doc, value, inside, depth + 1)?;
             }
@@ -166,7 +183,7 @@ impl Guard {
                         (Some(2), Object::Dict(_)) => {}
                         _ => return Err(PatternProblem::Unreadable),
                     }
-                    self.walk(doc, pattern, true, depth + 1)?;
+                    self.walk(doc, pattern, true, depth)?;
                 }
             } else {
                 if (inside && matches!(category.as_slice(), b"XObject" | b"Properties")) || category.as_slice() == b"ExtGState" {
@@ -215,7 +232,7 @@ impl Guard {
                         if let Object::Stream(stream) = object
                             && resolved(doc, stream.dict.get(b"Subtype"))?.as_name() == Some(b"Form")
                         {
-                            self.walk(doc, entry, inside, depth + 1)?;
+                            self.walk(doc, entry, inside, depth)?;
                         }
                     }
                 }
